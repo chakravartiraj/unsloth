@@ -13,7 +13,7 @@ A clear and concise description of what the bug is.  Please fill out the followi
 1. **Environment Setup:**
    - OS: [e.g., Ubuntu 20.04]
    - Python Version: [e.g., 3.8.10]
-   - Frameworks/Libraries: please paste output of `pip freeze` here
+   - Frameworks/Libraries: please attach the output of `pip freeze`: run `pip freeze > my_env.txt` then attach the file to this issue.
    - `colab` / script - was this run in `colab` or as a script?
 
 2. **Dataset Details:**
