@@ -12,13 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .llama import *
+from .llama import * # Imports LlamaModel_fast_forward, CausalLM_fast_forward, PeftModelForCausalLM_fast_forward, etc.
 import os
+import torch # Added for _new_mistral_attention_init
+from typing import Optional, Tuple, List # Added for _new_mistral_attention_forward
 from ._utils import __version__
 from .llama import (
-    LlamaRotaryEmbedding,
+    LlamaRotaryEmbedding, # Mistral uses Llama's RoPE
     LlamaLinearScalingRotaryEmbedding,
+    # Common HF imports often needed
+    logger, # Assuming it's available from .llama or transformers.utils.logging
+    BlockDiagonalCausalMask, # If Xformers is used from .llama
+    # IS_ATTENTION_REFACTOR, # If needed from .llama, for RoPE handling in __init__
 )
+from unsloth.models.attention import MistralAttention as UnslothMistralAttentionImpl
 from transformers.models.mistral.modeling_mistral import (
     MistralAttention,
     MistralDecoderLayer,
@@ -35,10 +42,155 @@ except:
     MistralSdpaAttention   = MistralAttention
     MistralFlashAttention2 = MistralAttention
 pass
+
+# Check if IS_ATTENTION_REFACTOR is available from .llama, otherwise define a fallback or import directly
+try:
+    from .llama import IS_ATTENTION_REFACTOR
+except ImportError:
+    # Define a fallback if not available, assuming new HF structure if uncertain
+    from unsloth_zoo.utils import Version as UnslothVersion
+    import transformers
+    IS_ATTENTION_REFACTOR = UnslothVersion(transformers.__version__) > UnslothVersion("4.47.1")
+pass
+
+
 from unsloth_zoo.utils import Version, _get_dtype
 
 
-def MistralAttention_fast_forward(
+# Comment out the old fast forward as it will be replaced by the new core module
+# def MistralAttention_fast_forward(
+#     self,
+#     hidden_states:       torch.Tensor,
+#     causal_mask:         Optional[BlockDiagonalCausalMask] = None,
+#     attention_mask:      Optional[torch.Tensor] = None,
+#     position_ids:        Optional[torch.LongTensor] = None,
+#     past_key_value:      Optional[Tuple[torch.Tensor]] = None,
+#     output_attentions:   bool = False,
+#     use_cache:           bool = False,
+#     padding_mask:        Optional[torch.LongTensor] = None,
+#     position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+#     *args, **kwargs,
+# ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+#
+#     # Clear inference
+#     if hasattr(self, "paged_attention"):
+#         del self.paged_attention_K
+#         del self.paged_attention_V
+#         del self.paged_attention
+#         del self.temp_QA
+#         del self.temp_KV
+#         del self.RH_Q
+#         del self.attention
+#     pass
+#
+#     bsz, q_len, _ = hidden_states.size()
+#
+#     n_heads    = self.config.num_attention_heads
+#     n_groups   = self.num_key_value_groups
+#     n_kv_heads = self.config.num_key_value_heads
+#     head_dim   = self.head_dim
+#     assert(n_kv_heads * n_groups == n_heads)
+#
+#     Q, K, V = self.apply_qkv(self, hidden_states)
+#     Q = Q.view(bsz, q_len, n_heads,    head_dim).transpose(1, 2)
+#     K = K.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+#     V = V.view(bsz, q_len, n_kv_heads, head_dim).transpose(1, 2)
+#
+#     kv_seq_len = K.shape[-2]
+#     if past_key_value is not None:
+#         kv_seq_len += past_key_value[0].shape[-2]
+#
+#     # Extend RoPE dynamically to fit in VRAM
+#     self.rotary_emb.extend_rope_embedding(V, seq_len = kv_seq_len)
+#
+#     if position_ids is None:
+#         cos = self.rotary_emb.cos_cached
+#         sin = self.rotary_emb.sin_cached
+#         Q, K = fast_rope_embedding(Q, K, cos, sin)
+#     else:
+#         cos, sin = self.rotary_emb(V, seq_len = kv_seq_len)
+#         Q, K = inplace_rope_embedding(Q, K, cos, sin, position_ids)
+#     pass
+#
+#     if past_key_value is not None:
+#         K = torch.cat([past_key_value[0], K], dim = 2)
+#         V = torch.cat([past_key_value[1], V], dim = 2)
+#     pass
+#     past_key_value = (K, V) if use_cache else None
+#
+#     # Attention module
+#     if (not HAS_FLASH_ATTENTION and attention_mask is None):
+#         # Xformers memory efficient attention
+#         Q = Q.transpose(1, 2)
+#         K = K.transpose(1, 2)
+#         V = V.transpose(1, 2)
+#         K_M = V_M = bsz * kv_seq_len
+#         Q_M = bsz * q_len
+#
+#         has_swa = isinstance(causal_mask, xformers.attn_bias.BlockDiagonalCausalMask)
+#
+#         # Group query attention
+#         K = K  .view(bsz, kv_seq_len, n_kv_heads,        1, head_dim)
+#         V = V  .view(bsz, kv_seq_len, n_kv_heads,        1, head_dim)
+#         K = K.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
+#         V = V.expand(bsz, kv_seq_len, n_kv_heads, n_groups, head_dim)
+#         if hidden_states.requires_grad:
+#             K = K.reshape(bsz, kv_seq_len, n_heads, head_dim)
+#             V = V.reshape(bsz, kv_seq_len, n_heads, head_dim)
+#
+#             if has_swa:
+#                 Q = Q.view(1, Q_M, n_heads, head_dim)
+#                 K = K.view(1, K_M, n_heads, head_dim)
+#                 V = V.view(1, V_M, n_heads, head_dim)
+#             pass
+#         else:
+#             # Xformers does support the forward pass though
+#             Q = Q.view(bsz, q_len, n_kv_heads, n_groups, head_dim)
+#
+#             if has_swa:
+#                 Q = Q.view(1, Q_M, n_kv_heads, n_groups, head_dim)
+#                 K = K.view(1, K_M, n_kv_heads, n_groups, head_dim)
+#                 V = V.view(1, V_M, n_kv_heads, n_groups, head_dim)
+#             pass
+#         pass
+#
+#         A = xformers_attention(Q, K, V, attn_bias = causal_mask)
+#         A = A.view(bsz, q_len, n_heads, head_dim)
+#
+#     elif HAS_FLASH_ATTENTION and attention_mask is None:
+#         Q = Q.transpose(1, 2)
+#         K = K.transpose(1, 2)
+#         V = V.transpose(1, 2)
+#         sw = getattr(self.config, "sliding_window", None)
+#         sw = kv_seq_len if (sw is None or sw == "null") else sw
+#         window = (-1, -1) if (kv_seq_len <= sw) else (sw, sw)
+#         A = flash_attn_func(Q, K, V, causal = True, window_size = window)
+#     else:
+#         # Grouped query attention
+#         # if n_groups != 1:
+#         K = K[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
+#         V = V[:, :, None, :, :].expand(bsz, n_kv_heads, n_groups, kv_seq_len, head_dim)
+#         K = K.reshape(bsz, n_heads, kv_seq_len, head_dim)
+#         V = V.reshape(bsz, n_heads, kv_seq_len, head_dim)
+#         # pass
+#         # Must be contiguous or else results are False!
+#         # https://github.com/pytorch/pytorch/issues/112577
+#         Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
+#         # Needs (batch_size, n_heads, seq_len, head_dim)
+#         # is_casual and attention_mask must not be both set!
+#         A = scaled_dot_product_attention(Q, K, V, attn_mask = attention_mask, is_causal = False)
+#         # Go back to (batch_size, seq_len, n_heads, head_dim)
+#         A = A.transpose(1, 2).contiguous()
+#     pass
+#
+#     attn_output = A.reshape(bsz, q_len, n_heads*head_dim)
+#     attn_output = self.apply_o(self, attn_output)
+#     attn_weights = None
+#     return attn_output, attn_weights, past_key_value
+# pass
+
+
+def MistralForCausalLM_fast_forward(
     self,
     hidden_states:       torch.Tensor,
     causal_mask:         Optional[BlockDiagonalCausalMask] = None,

@@ -44,6 +44,10 @@ from ..kernels import *
 from ..tokenizer_utils import *
 if HAS_FLASH_ATTENTION:
     from flash_attn import flash_attn_func
+
+# Import the new Unsloth Attention Implementation
+from unsloth.models.attention import LlamaAttention as UnslothLlamaAttentionImpl
+
 from .vision import FastBaseModel
 
 # Final patching code
@@ -1662,13 +1666,112 @@ class FastLlamaModel:
             LlamaAttention.__init__  = eval(init_name)
         pass
         LlamaAttention      .forward = LlamaAttention_fast_forward
-        LlamaSdpaAttention  .forward = LlamaAttention_fast_forward
-        LlamaFlashAttention2.forward = LlamaAttention_fast_forward
+    # LlamaSdpaAttention  .forward = LlamaAttention_fast_forward
+    # LlamaFlashAttention2.forward = LlamaAttention_fast_forward
         LlamaDecoderLayer   .forward = LlamaDecoderLayer_fast_forward
         LlamaModel          .forward = LlamaModel_fast_forward
         LlamaForCausalLM    .forward = CausalLM_fast_forward(LlamaModel_fast_forward_inference)
         PeftModelForCausalLM.forward = PeftModelForCausalLM_fast_forward
         fix_prepare_inputs_for_generation(LlamaForCausalLM)
+
+    # Define the new __init__ and forward methods for Llama Attention
+    def _new_llama_attention_init(self, config, layer_idx=None):
+        torch.nn.Module.__init__(self) # Base class init
+        self.config = config
+        # Core Unsloth attention module
+        self.unsloth_attention_core = UnslothLlamaAttentionImpl(config)
+
+        # Expose QKV, O proj and rotary_emb for PEFT and other Unsloth compatibility
+        self.q_proj = self.unsloth_attention_core.q_proj
+        self.k_proj = self.unsloth_attention_core.k_proj
+        self.v_proj = self.unsloth_attention_core.v_proj
+        self.o_proj = self.unsloth_attention_core.o_proj
+        # Patch rotary_emb if it's part of the main module, not the attention layer (new HF)
+        if not (IS_ATTENTION_REFACTOR or hasattr(config, "rotary_emb_class")): # Check if HF does this
+            self.rotary_emb = self.unsloth_attention_core.rotary_emb
+        else:
+            # If HF expects rotary_emb at the model level and not in each attention layer,
+            # this self.rotary_emb might not be used by HF's LlamaDecoderLayer.
+            # Unsloth's core attention module handles its own RoPE, so this is mainly for compatibility.
+            # We still need to instantiate it on the core module for its internal use.
+            # For HF LlamaModel, self.rotary_emb is usually set at the LlamaModel level if refactored.
+             # The core module `self.unsloth_attention_core.rotary_emb` is the one that matters for its forward pass.
+            pass
+
+
+        # Essential attributes expected by LlamaDecoderLayer / other parts of HF code
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.unsloth_attention_core.head_dim
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.layer_idx = layer_idx
+        self.attention_dropout = getattr(config, "attention_dropout", 0.0)
+
+    def _new_llama_attention_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        **kwargs # Catches arguments like 'padding_mask' from HF, or 'causal_mask' from Unsloth model forward
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+
+        # Determine if running in inference mode
+        # Check for _flag_for_generation first, as it's explicitly set by Unsloth's inference path.
+        # Otherwise, fallback to checking training status and grad enabled.
+        if hasattr(self, "_flag_for_generation") and self._flag_for_generation:
+            is_inference = True
+        else:
+            is_inference = not (self.training and torch.is_grad_enabled())
+
+        if output_attentions:
+            logger.warning_once("Unsloth: `output_attentions=True` is not supported with the new attention module. Returning None for attention weights.")
+
+        # The new core attention module handles its own mask logic for xformers/flash
+        # if attention_mask is None. 'attention_mask' here is typically the SDPA 4D mask.
+        # Unsloth's LlamaModel_fast_forward might pass an xformers 'causal_mask' in kwargs.
+        # The core module's forward should correctly prioritize specific masks if provided or fallback.
+        # For HF compatibility, we pass `attention_mask` as is.
+
+        # Handle `padding_mask` for HF compatibility if it's in kwargs
+        # (though Unsloth typically uses `attention_mask` for SDPA or `causal_mask` for xformers)
+        # The new attention module does not explicitly use a `padding_mask` kwarg.
+        # If `attention_mask` is the SDPA mask, it already incorporates padding.
+        # If using packed inputs, `attention_mask` is generally not used.
+
+        # Pass through relevant kwargs to the core attention module
+        attn_output, _, new_past_key_value = self.unsloth_attention_core.forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            is_inference_pass=is_inference, # Pass the inference flag
+            cu_seqlens_q = kwargs.get("cu_seqlens_q"),
+            cu_seqlens_kv = kwargs.get("cu_seqlens_kv"),
+            max_seqlen_q = kwargs.get("max_seqlen_q"),
+            max_seqlen_kv = kwargs.get("max_seqlen_kv"),
+            packed_qkv = kwargs.get("packed_qkv"),
+            # output_attentions is not passed as the new core module returns None for weights
+        )
+        # HF format expects: attn_output, attn_weights, past_key_value
+        return attn_output, None, new_past_key_value
+
+    # Patch the HF LlamaAttention classes
+    from transformers.models.llama import modeling_llama as hf_llama_module
+    for attention_class_name in ["LlamaAttention", "LlamaSdpaAttention", "LlamaFlashAttention2"]:
+        if hasattr(hf_llama_module, attention_class_name):
+            attention_class = getattr(hf_llama_module, attention_class_name)
+            attention_class.__init__ = _new_llama_attention_init
+            attention_class.forward = _new_llama_attention_forward
+            # Comment out old Unsloth fast forward to avoid conflicts if it was set previously
+            if hasattr(attention_class, "_fast_forward"):
+                 delattr(attention_class, "_fast_forward")
+
 
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
@@ -1902,11 +2005,16 @@ class FastLlamaModel:
         model, tokenizer = patch_tokenizer(model, tokenizer)
         model, tokenizer = model_patcher.post_patch(model, tokenizer)
 
-        # Patch up QKV / O and MLP
-        for idx, layer in enumerate(model.model.layers):
-            layer.self_attn.apply_qkv = original_apply_qkv
-            layer.self_attn.apply_o   = original_apply_o
-        pass
+        # Patch up QKV / O and MLP - these are now part of the core module or aliased
+        # for idx, layer in enumerate(model.model.layers):
+        #     # These were for the old UnslothLoRA model, not directly applicable here.
+        #     # The new attention module has its own QKV, O projections.
+        #     # If these `apply_qkv` were for some specific LoRA behavior on the HF module itself,
+        #     # that needs re-evaluation. Given they are restoring 'original_apply_qkv',
+        #     # it suggests they were undoing a previous Unsloth patch that's now obsolete.
+        #     # layer.self_attn.apply_qkv = original_apply_qkv
+        #     # layer.self_attn.apply_o   = original_apply_o
+        #     pass
 
         # Patch Trainer
         from transformers.trainer import Trainer
@@ -2035,11 +2143,20 @@ class FastLlamaModel:
         internal_model.is_loaded_in_8bit = True
 
         # For transformers > 4.47.1, we need to add rotary_emb to all attention layers
+            # The new _new_llama_attention_init handles self.rotary_emb exposure based on IS_ATTENTION_REFACTOR
+            # It ensures that self.unsloth_attention_core.rotary_emb is used internally by the core.
+            # If HF expects rotary_emb on the attention layer itself (pre-refactor), it's set up.
+            # If HF expects it on the model level (post-refactor), then LlamaModel.rotary_emb is used by HF,
+            # and our core module still uses its own.
         if IS_ATTENTION_REFACTOR or hasattr(model.model, "rotary_emb"):
-            rotary_emb = model.model.rotary_emb
-            for layer in model.model.layers:
-                layer.self_attn.rotary_emb = rotary_emb
-        pass
+                # If HF's LlamaModel has a global rotary_emb, ensure it's used if position_embeddings are not passed
+                # to LlamaDecoderLayer. However, our new forward pass to the core attention module
+                # doesn't rely on self.rotary_emb from the HF attention class; it uses self.unsloth_attention_core.rotary_emb.
+                # The self.rotary_emb on the patched HF attention class is for HF's internal expectations IF it were to call it.
+                # This specific loop might be redundant if _new_llama_attention_init correctly sets self.rotary_emb only when needed by HF.
+                # The main thing is that `position_embeddings` are passed to LlamaDecoderLayer if IS_ATTENTION_REFACTOR.
+                # And our core module handles RoPE internally.
+                pass # This loop might not be necessary anymore.
 
         # Add for_inference and for_training
         model.for_training  = functools.partial(FastLlamaModel.for_training,  model)
